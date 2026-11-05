@@ -73,11 +73,14 @@ class ResidualSignatureCBM(IndividualCBM):
     def residual(self, x):
         """Remove the detached projection of x onto the concept-layer weight rows."""
         weight = self.concept_layer.weight
-        projected = F.linear(x, weight)
-        gram = weight @ weight.transpose(0, 1)
-        ridge = 1e-4 * torch.eye(gram.shape[0], device=x.device, dtype=x.dtype)
-        coeff = torch.linalg.solve(gram + ridge, projected)
-        return x - (coeff @ weight).detach()
+        with torch.no_grad():
+            projected = F.linear(x, weight)
+            gram = weight @ weight.transpose(0, 1)
+            ridge = 1e-4 * torch.eye(gram.shape[0], device=x.device, dtype=x.dtype)
+            # solve treats a matrix right-hand side as columns, so the batch axis goes last.
+            coeff = torch.linalg.solve(gram + ridge, projected.transpose(0, 1)).transpose(0, 1)
+            projection = coeff @ weight
+        return x - projection
 
     def forward(self, x):
         raw, z = self.bottleneck(x)
