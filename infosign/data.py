@@ -8,7 +8,7 @@ from torch.utils.data import Dataset,DataLoader,Subset
 from infosign.common import (MODALITIES,FULL_CONFIGS,BASIC_KEYS,HISTORY_TARGETS,original_config,
                     read_json,write_json,save_torch)
 from infosign.native_data import (OT2V2Dataset,FrozenScalerGroup,SOURCE_FLAG_BY_GROUP,
-                            RETINAL_GROUPS,_pad_temporal)
+                            RETINAL_GROUPS,_pad_temporal,validated_boolean_mask)
 from infosign.encoders import Task2V2ModelConfig,build_retinal_backbone
 from infosign.native_data import as_person_id
 
@@ -74,10 +74,11 @@ def clinical_inputs(task,cfg,entry):
     table['person_id']=table.person_id.map(as_person_id);table=table.set_index('person_id')
     names=list(scaler.feature_order);raw=torch.as_tensor(table.loc[ids,names].to_numpy(dtype=np.float32))
     if task in FULL_CONFIGS or entry.get('task_specific_clinical'):
-        acquired=master.has_clinical.astype(str).str.lower().isin(('true','1')).to_numpy()
+        acquired=master.has_clinical.astype(str).str.lower().isin(('true','1','1.0')).to_numpy()
     else:
         presence=read_json(Path(cfg.get('source_root',cfg['output_root']))/'full_clinical_presence.json')
         acquired=np.asarray([presence[pid] for pid in ids])
+    acquired=validated_boolean_mask(acquired, task+' clinical presence')
     mask=torch.isfinite(raw)&torch.as_tensor(acquired).unsqueeze(1)
     values=scaler.normalise(raw,mask,'clinical')
     keep=list(range(len(names)));excluded=[]
