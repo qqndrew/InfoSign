@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Full/Basic models, their ablations, and Mixed-CBM concept interventions."""
+"""Run Full/Basic models, their ablations, Mixed-CBM interventions, and the selected-concept CBM."""
 import argparse
 import fcntl
 import os
@@ -33,6 +33,9 @@ def run_worker(cfg, task, phase, cpu=False):
     if phase=='concept-diagnostics':
         from infosign.cbm.diagnostics import run_diagnostics
         run_diagnostics(task,cfg,device)
+    elif phase=='signature':
+        from infosign.cbm.signature import run_signature
+        run_signature(task,cfg,device)
     elif phase=='analyze':
         from infosign.analysis import run_analysis
         run_analysis(task,cfg,device)
@@ -97,8 +100,8 @@ def main():
     p.add_argument('--config',type=Path,default=HERE/'config.yaml')
     p.add_argument('--devices',nargs='+');p.add_argument('--source-root',type=Path)
     p.add_argument('--output-root',type=Path)
-    p.add_argument('--stage',choices=('all','train','analyze','report','concept-diagnostics','concept-diagnostics-report'),default='all')
-    p.add_argument('--worker',choices=('full','basic','analyze','concept-diagnostics'),help=argparse.SUPPRESS)
+    p.add_argument('--stage',choices=('all','train','analyze','report','concept-diagnostics','concept-diagnostics-report','signature','signature-report'),default='all')
+    p.add_argument('--worker',choices=('full','basic','analyze','concept-diagnostics','signature'),help=argparse.SUPPRESS)
     p.add_argument('--task',help=argparse.SUPPRESS)
     p.add_argument('--cpu',action='store_true',help=argparse.SUPPRESS)
     a=p.parse_args();settings=yaml.safe_load(a.config.read_text())
@@ -123,6 +126,7 @@ def main():
     from infosign.common import read_json,write_json
     from infosign.report import make_report
     diagnostics = a.stage in ('concept-diagnostics','concept-diagnostics-report')
+    signature = a.stage == 'signature'
     runtime=root/'runtime.yaml'
     if runtime.exists():
         previous=yaml.safe_load(runtime.read_text())
@@ -133,11 +137,15 @@ def main():
     if a.stage in ('report','concept-diagnostics-report'):
         make_reports(cfg,concepts_only=diagnostics)
         return
+    if a.stage == 'signature-report':
+        from infosign.cbm.signature import make_signature_report
+        make_signature_report(cfg)
+        return
     with (root/'.run.lock').open('a') as lock:
         try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError:raise RuntimeError('A process is already using this output directory') from None
         runtime.write_text(yaml.safe_dump(cfg,sort_keys=False))
-        status_path = root/('CONCEPT_DIAGNOSTICS_STATUS.json' if diagnostics else 'STATUS.json')
+        status_path = root/('CONCEPT_DIAGNOSTICS_STATUS.json' if diagnostics else 'SIGNATURE_STATUS.json' if signature else 'STATUS.json')
         status=dict(status='running',stage=a.stage,tasks=cfg['tasks']);write_json(status_path,status)
         try:
             if a.stage in ('all','train'):
@@ -159,11 +167,23 @@ def main():
             if diagnostics or a.stage in ('all','analyze'):
                 jobs=[(task+'_concept_diagnostics',['--task',task,'--worker','concept-diagnostics']) for task in cfg['tasks']]
                 pool(jobs,cfg['devices'],runtime,root,after=lambda:make_reports(cfg,concepts_only=True))
+            if a.stage in ('all','signature'):
+                from infosign.cbm.signature import make_signature_report
+                missing=[t for t in cfg['tasks'] if not (root/t/'concept_diagnostics'/'restoration.csv').exists()
+                         or not (root/t/'mixed_cbm'/'model.pt').exists()]
+                if missing:
+                    raise FileNotFoundError('Selected-concept CBM requires concept diagnostics and the Mixed CBM for: '+', '.join(missing))
+                jobs=[(task+'_signature',['--task',task,'--worker','signature']) for task in cfg['tasks']]
+                pool(jobs,cfg['devices'],runtime,root,after=lambda:make_signature_report(cfg))
             status['status']='complete';write_json(status_path,status)
-            make_reports(cfg,concepts_only=diagnostics)
+            if a.stage in ('all','signature'):
+                from infosign.cbm.signature import make_signature_report
+                make_signature_report(cfg)
+            if not signature:
+                make_reports(cfg,concepts_only=diagnostics)
         except BaseException as exc:
             status.update(status='failed',error=str(exc));write_json(status_path,status);raise
-    print(('CONCEPT_DIAGNOSTICS_COMPLETE: ' if diagnostics else 'STUDY_COMPLETE: ')+
+    print(('CONCEPT_DIAGNOSTICS_COMPLETE: ' if diagnostics else 'SIGNATURE_COMPLETE: ' if signature else 'STUDY_COMPLETE: ')+
           str(root/('tables/concept_diagnostics' if diagnostics else 'tables')),flush=True)
 
 if __name__=='__main__':main()
