@@ -27,12 +27,13 @@ def auroc(y, probability):
     return float(values[0]) if p.ndim == 1 else values
 
 
-def auroc_selection(gains, eligible=None):
-    """Select individual IDs strictly above their own distribution's μ + 2σ.
+def auroc_selection(gains, eligible=None, sigmas=2):
+    """Select individual IDs strictly above their own distribution's μ + kσ.
 
     Call once per task, split and intervention population, without a joint/all-ID
-    row. σ is the population SD (ddof=0). This is descriptive selection, not a
-    significance test; zero/negative effects are not additionally filtered.
+    row. σ is the population SD (ddof=0) and k defaults to 2. This is descriptive
+    selection, not a significance test; zero/negative effects are not additionally
+    filtered.
     """
     gains = np.asarray(gains, float)
     valid = np.isfinite(gains)
@@ -40,7 +41,7 @@ def auroc_selection(gains, eligible=None):
     n = int(valid.sum()); values = gains[valid]
     mean = float(values.mean()) if n else np.nan
     std = float(values.std(ddof=0)) if n else np.nan
-    cutoff = mean + 2*std
+    cutoff = mean + sigmas*std
     rank = np.full(len(gains), np.nan)
     rank[valid] = np.searchsorted(np.sort(-values), -values, side='left') + 1
     return dict(auroc_rank_within_split=rank,

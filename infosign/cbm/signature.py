@@ -16,14 +16,17 @@ from infosign.cbm.diagnostics import METRICS, interval_fields
 from infosign.cbm.model import IndividualCBM, fit, predict, restore
 
 
-VERSION = 2
+VERSION = 3
 BYPASS = 'residual'
+SELECTION_SIGMAS = 1
+CUTOFF_LABEL = f'μ + {SELECTION_SIGMAS:g}σ'
 
 
 def validation_concepts(restoration):
     """Select Concept IDs from the validation predicted-restoration distribution.
 
     Test rows are removed before the mean and population SD are computed.
+    An ID is kept only when its gain is strictly above μ + 1σ.
     """
     group = restoration[
         (restoration['split'].astype(str) == 'val')
@@ -34,7 +37,7 @@ def validation_concepts(restoration):
         raise ValueError('Validation predicted-restoration rows are missing')
     group = group.reset_index(drop=True)
     gains = pd.to_numeric(group['auroc_gain'], errors='coerce').to_numpy(float)
-    for key, values in auroc_selection(gains).items():
+    for key, values in auroc_selection(gains, sigmas=SELECTION_SIGMAS).items():
         group[key] = values
     selected = group[group['auroc_selected'].astype(bool)].sort_values(
         ['auroc_rank_within_split', 'concept_id'], kind='stable')
@@ -54,6 +57,7 @@ def validation_concepts(restoration):
         n_evaluated=int(first.auroc_selection_n),
         mean=float(first.auroc_selection_mean),
         std=float(first.auroc_selection_std),
+        sigmas=SELECTION_SIGMAS,
         cutoff=float(first.auroc_selection_cutoff),
         concept_ids=[item['concept_id'] for item in concepts],
         concepts=concepts)
@@ -242,8 +246,8 @@ def run_variant(task, cfg, device, variant, selection):
             version=VERSION, task=task, variant=variant['name'], skipped=True,
             reason='no_validation_concept_above_cutoff', bypass=variant['bypass'],
             n_evaluated=selection['n_evaluated'], mean=selection['mean'], std=selection['std'],
-            cutoff=selection['cutoff']))
-        print(f'[signature {task}/{variant["name"]}] no validation concept exceeded μ + 2σ; skipped', flush=True)
+            sigmas=selection['sigmas'], cutoff=selection['cutoff']))
+        print(f'[signature {task}/{variant["name"]}] no validation concept exceeded {CUTOFF_LABEL}; skipped', flush=True)
         return
     trained_path = root / 'TRAINING_DONE.json'
     trained = read_json(trained_path) if trained_path.exists() else {}
@@ -283,7 +287,7 @@ def run_variant(task, cfg, device, variant, selection):
         n_concepts=len(selection['concept_ids']), n_items=len(artifact['spec']['items']),
         learned_items=sum(item['learnable'] for item in artifact['spec']['items']),
         width=artifact['spec']['width'], n_evaluated=selection['n_evaluated'], mean=selection['mean'],
-        std=selection['std'], cutoff=selection['cutoff'], bypass=variant['bypass'],
+        std=selection['std'], sigmas=selection['sigmas'], cutoff=selection['cutoff'], bypass=variant['bypass'],
         input_backbone='full', backbone_frozen=True,
         concept_lambda=cfg['concept_lambda'], concept_tolerance=cfg['concept_tolerance']))
     if device.type == 'cuda':
@@ -515,7 +519,7 @@ def make_signature_report(cfg):
                  'The bottleneck run routes the outcome through those concepts only. '
                  'The residual-bypass run also gives the outcome MLP the part of the frozen embedding orthogonal to the concept-layer weights. '
                  'μ and σ are the mean and population SD (ddof=0) of the individual validation predicted-restoration gains, '
-                 'and an ID is kept only when its validation gain is strictly above μ + 2σ. '
+                 f'and an ID is kept only when its validation gain is strictly above {CUTOFF_LABEL}. '
                  'Test gains are not used to choose the concept list.', '',
                  'Masking removes nonbasic clinical inputs; Basic Clinical features and the other eight modalities remain. '
                  'Each run selects its checkpoint and decision threshold on masked validation inputs.', '',
@@ -526,12 +530,12 @@ def make_signature_report(cfg):
             record = _selection_record(root, task)
             cutoff_rows.append([_label(task), record['n_evaluated'], f'{record["mean"]:+.6f}',
                                 f'{record["std"]:.6f}', f'{record["cutoff"]:+.6f}', len(record['concept_ids'])])
-        lines += [md(['Task', 'Evaluated IDs', 'μ', 'σ', 'μ + 2σ', 'Selected IDs'], cutoff_rows)]
+        lines += [md(['Task', 'Evaluated IDs', 'μ', 'σ', CUTOFF_LABEL, 'Selected IDs'], cutoff_rows)]
         for task in tasks:
             chosen = concepts[(concepts.task == task) & (concepts.n_selected > 0)]
             lines += [f'### {_label(task)}', '']
             if chosen.empty:
-                lines += ['No Concept ID exceeded the validation μ + 2σ cutoff, so neither run was trained.', '']
+                lines += [f'No Concept ID exceeded the validation {CUTOFF_LABEL} cutoff, so neither run was trained.', '']
                 continue
             lines += [md(['Validation rank', 'Concept ID', 'Concept', 'Source fields', 'Validation ΔAUROC'],
                          [[int(row.validation_rank), row.concept_id, row.concept_name, row.source_fields,
