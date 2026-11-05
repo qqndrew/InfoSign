@@ -103,6 +103,25 @@ def source_key(value):
     return str(value).split(",", 1)[0].strip().lower()
 
 
+def parse_calendar_date(raw):
+    """Accept ISO timestamps and the local M/D/YY[YY] [H:MM[:SS]] export."""
+    text = str(raw).strip()
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        if len(text) == 10:
+            return date.fromisoformat(text)
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+    if text.count("/") == 2:
+        calendar, _, time = text.partition(" ")
+        year = calendar.rsplit("/", 1)[1]
+        if len(year) not in (2, 4):
+            raise ValueError("invalid_date")
+        fmt = "%m/%d/%y" if len(year) == 2 else "%m/%d/%Y"
+        if time:
+            fmt += " %H:%M:%S" if time.count(":") == 2 else " %H:%M"
+        return datetime.strptime(text, fmt).date()
+    raise ValueError("invalid_date")
+
+
 def recorded_date(row, prefix):
     dates = []
     for field in (prefix+"_date", prefix+"_datetime"):
@@ -110,7 +129,7 @@ def recorded_date(row, prefix):
         if raw.lower() in ("", "nan", "nat", "null", "none"):
             continue
         try:
-            dates.append(date.fromisoformat(raw) if len(raw) == 10 else datetime.fromisoformat(raw.replace("Z", "+00:00")).date())
+            dates.append(parse_calendar_date(raw))
         except ValueError:
             raise ValueError("invalid_date") from None
     if not dates or len(set(dates)) != 1:
