@@ -9,7 +9,7 @@ InfoSign combines nine AI-READI data sources for clinical prediction and examine
 | **Full Clinical model** | Downstream classification, basic-only clinical inputs at inference, and 11 modality ablations |
 | **Basic Clinical model** | Downstream classification and the same 11 modality ablations |
 | **Mixed CBM** | Full/masked-input classification, predicted-concept restoration, and measured-concept supplementation |
-| **Selected-concept CBM** | New bottleneck using only validation μ + 2σ concepts, compared under full and masked clinical inputs |
+| **Selected-concept CBM** | Two runs from the validation μ + 2σ concepts: bottleneck only, and the same bottleneck with a residual embedding bypass |
 
 ## Setup and data
 
@@ -77,7 +77,7 @@ Channels sharing a Concept ID are changed together. [Concept definitions](infosi
 
 Training uses seed 42 and training-only minority oversampling. Validation/test retain natural class proportions; checkpoints and fixed classification thresholds are validation-selected. Reports include AUROC, positive-class F1, balanced accuracy, Brier scores, and 10,000 paired, outcome-stratified bootstrap resamples. Concept IDs exceeding the task/intervention/split mean ΔAUROC + 2 population SD are highlighted. Test ranking is exploratory, not a significance test; intervals do not adjust for selection or training-seed variability.
 
-The selected-concept CBM is trained after those diagnostics. For each task, μ and σ are computed only from validation predicted-restoration ΔAUROC, and a Concept ID is kept only when its validation gain is strictly above μ + 2 population SD. A new concept layer and outcome MLP are then trained on the frozen Full Clinical backbone using only those concepts; there is no bypass around the concept layer. The saved all-concept Mixed CBM is left unchanged. Test gains do not choose the concept list. The robustness comparison is the paired drop from full inputs to masked inputs for the selected-concept CBM, the all-concept Mixed CBM, and the Full Clinical model.
+The selected-concept stage trains two models from the same validation concept list. For each task, μ and σ are computed only from validation predicted-restoration ΔAUROC, and a Concept ID is kept only when its validation gain is strictly above μ + 2 population SD. Both models use a new concept layer on the frozen Full Clinical backbone containing only those concepts. The bottleneck run sends the outcome through that layer only. The residual-bypass run also gives the outcome MLP the part of the frozen embedding orthogonal to the concept-layer weights. The saved all-concept Mixed CBM is left unchanged. Test gains do not choose the concept list. Each run is compared by its paired drop from full inputs to masked inputs, and the two runs are compared with each other.
 
 ```bash
 python -u run.py --stage signature
@@ -96,9 +96,11 @@ Prepared data are stored in `outputs/preprocessed/` and `outputs/prepared/`. Exp
 | `{PREDICTED,MEASURED}_CONCEPT_RECOVERY_{ALL,SELECTED}_test.csv` | All individual-ID effects and selected concepts |
 | `MIXED_CBM_PERFORMANCE_test.csv`, `ALL_CONCEPTS_RESTORED_test.csv` | Full/masked CBM performance and simultaneous predicted restoration |
 | `concept_diagnostics/` | Concept quality, probability diagnostics, and observed-label-subset results |
-| `SUMMARY_SIGNATURE_test.md` | Selected-concept CBM performance and full-to-masked drops |
-| `SIGNATURE_CBM_test.csv` | Performance under both inputs and paired masking losses |
-| `SIGNATURE_CONCEPTS.csv` | Concept IDs frozen by validation μ + 2σ |
+| `SUMMARY_SIGNATURE_test.md` | Both selected-concept runs and their full-to-masked drops |
+| `SIGNATURE_CBM_test.csv` | Bottleneck run: performance and paired masking losses |
+| `SIGNATURE_CBM_RESIDUAL_test.csv` | Residual-bypass run: performance and paired masking losses |
+| `SIGNATURE_BYPASS_COMPARISON_test.csv` | Paired residual-bypass minus bottleneck comparison |
+| `SIGNATURE_CONCEPTS.csv` | Concept IDs frozen by validation μ + 2σ, shared by both runs |
 
 | Location | Purpose |
 |---|---|

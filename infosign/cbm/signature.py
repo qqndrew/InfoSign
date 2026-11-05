@@ -1,22 +1,23 @@
-"""Selected-concept Mixed CBM.
+"""Two selected-concept Mixed CBMs from one validation concept list.
 
-Concept IDs are frozen from validation predicted-restoration gains before
-training. The new concept layer contains only those IDs, and the outcome MLP
-reads only that concept vector.
+The bottleneck run routes the outcome through the selected concepts only.
+The residual run also passes the embedding component orthogonal to that layer.
 """
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from torch.nn import functional as F
 from infosign.common import TASK_LABELS, backbone_dir, read_json, write_json, save_torch
 from infosign.report import interval, md
 from infosign.stats import PairedF1, auroc_selection
 from infosign.train import load
 from infosign.cbm.diagnostics import METRICS, interval_fields
-from infosign.cbm.model import fit, predict, restore
+from infosign.cbm.model import IndividualCBM, fit, predict, restore
 
 
-VERSION = 1
+VERSION = 2
+BYPASS = 'residual'
 
 
 def validation_concepts(restoration):
@@ -58,6 +59,60 @@ def validation_concepts(restoration):
         concepts=concepts)
 
 
+class ResidualSignatureCBM(IndividualCBM):
+    """Selected concepts plus the embedding component those concepts do not read."""
+
+    bypass_kind = BYPASS
+
+    def __init__(self, spec, hidden=32):
+        super().__init__(spec, hidden)
+        self.bypass = torch.nn.Sequential(torch.nn.Linear(spec['input_dim'], hidden), torch.nn.ReLU())
+        self.task_head = torch.nn.Sequential(
+            torch.nn.Linear(spec['width'] + hidden, hidden), torch.nn.ReLU(), torch.nn.Linear(hidden, 1))
+
+    def residual(self, x):
+        """Remove the detached projection of x onto the concept-layer weight rows."""
+        weight = self.concept_layer.weight
+        projected = F.linear(x, weight)
+        gram = weight @ weight.transpose(0, 1)
+        ridge = 1e-4 * torch.eye(gram.shape[0], device=x.device, dtype=x.dtype)
+        coeff = torch.linalg.solve(gram + ridge, projected)
+        return x - (coeff @ weight).detach()
+
+    def forward(self, x):
+        raw, z = self.bottleneck(x)
+        features = torch.cat((z, self.bypass(self.residual(x))), dim=1)
+        return raw, z, self.task_head(features).squeeze(-1)
+
+
+VARIANTS = (
+    dict(name='bottleneck', folder='signature_cbm', model_cls=IndividualCBM, bypass=None,
+         key='signature_bottleneck', label='Selected-concept CBM'),
+    dict(name='residual', folder='signature_cbm_residual', model_cls=ResidualSignatureCBM,
+         bypass=BYPASS, key='signature_residual', label='Selected-concept CBM with residual bypass'),
+)
+BASELINE_NAMES = {'mixed_cbm': 'All-concept Mixed CBM', 'full_clinical': 'Full Clinical model'}
+
+
+def load_variant(artifact, device, model_cls):
+    model = model_cls(artifact['spec']).to(device)
+    model.load_state_dict(artifact['states']['joint'])
+    model.requires_grad_(False)
+    return model.eval()
+
+
+def relocate_residual_checkpoint(task_root):
+    """Keep an earlier residual run that was saved in the bottleneck directory."""
+    source = task_root / 'signature_cbm'
+    destination = task_root / 'signature_cbm_residual'
+    marker = source / 'TRAINING_DONE.json'
+    if destination.exists() or not marker.exists():
+        return
+    if read_json(marker).get('bypass') == BYPASS:
+        source.rename(destination)
+        print(f'[signature] moved residual checkpoint to {destination.name}', flush=True)
+
+
 def restrict_schema(schema, concept_ids):
     """Keep every schema item whose Concept ID was selected, in inventory order."""
     wanted = set(map(str, concept_ids))
@@ -95,14 +150,15 @@ def _loss_row(boot, full, masked, full_cut, masked_cut, metric):
     return row
 
 
-def evaluate(task, cfg, device, artifact):
+def evaluate(task, cfg, device, artifact, variant):
     """Score full and masked inputs and the paired loss caused by masking."""
     root = Path(cfg['output_root']) / task
     mixed_artifact = load(root / 'mixed_cbm' / 'model.pt')
-    signature = restore(artifact, device)
+    signature = load_variant(artifact, device, variant['model_cls'])
     mixed = restore(mixed_artifact, device)
     full_cut = read_json(backbone_dir(task, cfg) / 'full' / 'TRAINING_DONE.json')['threshold']
-    cuts = {'signature_cbm': artifact['threshold'], 'mixed_cbm': mixed_artifact['threshold'],
+    key = variant['key']
+    cuts = {key: artifact['threshold'], 'mixed_cbm': mixed_artifact['threshold'],
             'full_clinical': full_cut}
     performance, comparisons = [], []
     for split in ('val', 'test'):
@@ -110,7 +166,7 @@ def evaluate(task, cfg, device, artifact):
         y = cache['y'].numpy()
         boot = PairedF1(y, cfg['bootstrap_samples'], cfg['seed'], device)
         probabilities = {
-            'signature_cbm': {
+            key: {
                 'full': predict(signature, cache['embedding'])[1],
                 'masked': predict(signature, cache['masked_embedding'])[1]},
             'mixed_cbm': {
@@ -134,62 +190,65 @@ def evaluate(task, cfg, device, artifact):
         for inputs in ('full', 'masked'):
             for metric in METRICS:
                 effect = boot.effects(
-                    probabilities['signature_cbm'][inputs], probabilities['mixed_cbm'][inputs],
-                    cuts['signature_cbm'], cuts['mixed_cbm'], METRICS[metric])[0]
+                    probabilities[key][inputs], probabilities['mixed_cbm'][inputs],
+                    cuts[key], cuts['mixed_cbm'], METRICS[metric])[0]
                 comparisons.append(dict(
-                    task=task, split=split, contrast='within_input', model='signature_cbm',
+                    task=task, split=split, contrast='within_input', model=key,
                     inputs=inputs, reference='mixed_cbm', metric=metric, n=len(y), **effect))
         for reference in ('mixed_cbm', 'full_clinical'):
             for metric in METRICS:
                 gain = boot.intervals(
                     _loss_draws(boot, probabilities[reference]['full'], probabilities[reference]['masked'],
                                 cuts[reference], cuts[reference], metric)
-                    - _loss_draws(boot, probabilities['signature_cbm']['full'],
-                                  probabilities['signature_cbm']['masked'],
-                                  cuts['signature_cbm'], cuts['signature_cbm'], metric))[0]
+                    - _loss_draws(boot, probabilities[key]['full'], probabilities[key]['masked'],
+                                  cuts[key], cuts[key], metric))[0]
                 comparisons.append(dict(
-                    task=task, split=split, contrast='robustness', model='signature_cbm', inputs='',
+                    task=task, split=split, contrast='robustness', model=key, inputs='',
                     reference=reference, metric=metric, n=len(y), p_value=np.nan, **gain))
+        pd.DataFrame(dict(person_id=cache['person_ids'], y=y,
+                          full_probability=probabilities[key]['full'],
+                          masked_probability=probabilities[key]['masked'])).to_csv(
+            root / variant['folder'] / f'predictions_{split}.csv', index=False)
         del boot
-        print(f'[signature {task}/{split}] full and masked inputs scored', flush=True)
-    folder = root / 'signature_cbm'
+        print(f'[signature {task}/{variant["name"]}/{split}] full and masked inputs scored', flush=True)
+    folder = root / variant['folder']
     pd.DataFrame(performance).to_csv(folder / 'performance.csv', index=False)
     pd.DataFrame(comparisons).to_csv(folder / 'comparisons.csv', index=False)
 
 
-def run_signature(task, cfg, device):
-    root = Path(cfg['output_root']) / task / 'signature_cbm'
+def _finished(folder):
+    marker = folder / 'DONE.json'
+    if not marker.exists() or read_json(marker).get('version') != VERSION:
+        return False
+    if read_json(marker).get('skipped'):
+        return True
+    return all((folder / name).exists() for name in (
+        'model.pt', 'performance.csv', 'comparisons.csv', 'predictions_val.csv', 'predictions_test.csv'))
+
+
+def run_variant(task, cfg, device, variant, selection):
+    root = Path(cfg['output_root']) / task / variant['folder']
     root.mkdir(parents=True, exist_ok=True)
     done_path = root / 'DONE.json'
-    if done_path.exists() and read_json(done_path).get('version') == VERSION:
-        required = () if read_json(done_path).get('skipped') else ('model.pt', 'performance.csv', 'comparisons.csv')
-        if all((root / name).exists() for name in required):
-            print(f'[reuse] {task}/signature_cbm', flush=True)
-            return
-    restoration_path = Path(cfg['output_root']) / task / 'concept_diagnostics' / 'restoration.csv'
-    if not restoration_path.exists():
-        raise FileNotFoundError(
-            f'{task} concept diagnostics are required before the selected-concept CBM: {restoration_path}')
-    if not (Path(cfg['output_root']) / task / 'mixed_cbm' / 'model.pt').exists():
-        raise FileNotFoundError(f'{task} Mixed CBM checkpoint is required for comparison')
-    restoration = pd.read_csv(restoration_path, dtype={'concept_id': str})
-    selection = validation_concepts(restoration)
-    selection['task'] = task
+    if _finished(root):
+        print(f'[reuse] {task}/{variant["folder"]}', flush=True)
+        return
     write_json(root / 'selected_concepts.json', selection)
     if not selection['concept_ids']:
         write_json(done_path, dict(
-            version=VERSION, task=task, skipped=True, reason='no_validation_concept_above_cutoff',
+            version=VERSION, task=task, variant=variant['name'], skipped=True,
+            reason='no_validation_concept_above_cutoff', bypass=variant['bypass'],
             n_evaluated=selection['n_evaluated'], mean=selection['mean'], std=selection['std'],
             cutoff=selection['cutoff']))
-        print(f'[signature {task}] no validation concept exceeded μ + 2σ; skipped', flush=True)
+        print(f'[signature {task}/{variant["name"]}] no validation concept exceeded μ + 2σ; skipped', flush=True)
         return
     trained_path = root / 'TRAINING_DONE.json'
     trained = read_json(trained_path) if trained_path.exists() else {}
-    reuse_training = (trained.get('version') == VERSION and (root / 'model.pt').exists()
-                      and trained.get('concept_ids') == selection['concept_ids'])
+    reuse_training = (trained.get('version') == VERSION and trained.get('bypass') == variant['bypass']
+                      and trained.get('concept_ids') == selection['concept_ids'] and (root / 'model.pt').exists())
     if reuse_training:
         artifact = load(root / 'model.pt')
-        print(f'[reuse training] {task}/signature_cbm', flush=True)
+        print(f'[reuse training] {task}/{variant["folder"]}', flush=True)
     else:
         labels = pd.read_csv(Path(cfg['output_root']) / 'labels' / task / 'labels.csv', dtype=str, keep_default_na=False)
         schema = restrict_schema(read_json(Path(cfg['output_root']) / 'labels' / task / 'schema.json'), selection['concept_ids'])
@@ -198,8 +257,10 @@ def run_signature(task, cfg, device):
         val = load(source / 'features_val.pt')
         validation = {**val, 'embedding': val['masked_embedding']}
         torch.set_float32_matmul_precision('highest')
-        print(f'[signature {task}] {len(selection["concept_ids"])} validation concepts, {len(schema["concepts"])} items', flush=True)
-        artifact, history = fit(train, validation, labels, schema, cfg, device, masked_train=train['masked_embedding'])
+        print(f'[signature {task}/{variant["name"]}] {len(selection["concept_ids"])} validation concepts, '
+              f'{len(schema["concepts"])} items', flush=True)
+        artifact, history = fit(train, validation, labels, schema, cfg, device,
+                                masked_train=train['masked_embedding'], model_cls=variant['model_cls'])
         retained = {str(item['concept_id']) for item in artifact['spec']['items']}
         if retained != set(selection['concept_ids']):
             raise RuntimeError(f'{task} concept layer IDs {sorted(retained)} differ from the frozen validation list')
@@ -207,22 +268,90 @@ def run_signature(task, cfg, device):
         pd.DataFrame(history).to_csv(root / 'training.csv', index=False)
         write_json(root / 'concept_definitions.json', artifact['spec']['items'])
         write_json(trained_path, dict(
-            version=VERSION, task=task, threshold=artifact['threshold'], selection=artifact['selection'],
-            concept_ids=selection['concept_ids'], n_concepts=len(selection['concept_ids']),
-            n_items=len(artifact['spec']['items']),
+            version=VERSION, task=task, variant=variant['name'], threshold=artifact['threshold'],
+            selection=artifact['selection'], concept_ids=selection['concept_ids'],
+            n_concepts=len(selection['concept_ids']), n_items=len(artifact['spec']['items']),
             learned_items=sum(item['learnable'] for item in artifact['spec']['items']),
-            width=artifact['spec']['width'], bypass=False, backbone_frozen=True))
-    evaluate(task, cfg, device, artifact)
+            width=artifact['spec']['width'], bypass=variant['bypass'], backbone_frozen=True))
+    evaluate(task, cfg, device, artifact, variant)
     write_json(done_path, dict(
-        version=VERSION, task=task, skipped=False, threshold=artifact['threshold'],
+        version=VERSION, task=task, variant=variant['name'], skipped=False, threshold=artifact['threshold'],
         selection=artifact['selection'], concept_ids=selection['concept_ids'],
-        n_concepts=len(selection['concept_ids']),
-        n_items=len(artifact['spec']['items']),
+        n_concepts=len(selection['concept_ids']), n_items=len(artifact['spec']['items']),
         learned_items=sum(item['learnable'] for item in artifact['spec']['items']),
-        width=artifact['spec']['width'],
-        n_evaluated=selection['n_evaluated'], mean=selection['mean'], std=selection['std'],
-        cutoff=selection['cutoff'], bypass=False, input_backbone='full', backbone_frozen=True,
+        width=artifact['spec']['width'], n_evaluated=selection['n_evaluated'], mean=selection['mean'],
+        std=selection['std'], cutoff=selection['cutoff'], bypass=variant['bypass'],
+        input_backbone='full', backbone_frozen=True,
         concept_lambda=cfg['concept_lambda'], concept_tolerance=cfg['concept_tolerance']))
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
+
+def compare_variants(task, cfg, device):
+    """Paired residual-bypass minus bottleneck comparison on saved probabilities."""
+    root = Path(cfg['output_root']) / task
+    done = {}
+    for variant in VARIANTS:
+        marker = root / variant['folder'] / 'DONE.json'
+        if not marker.exists():
+            return
+        done[variant['name']] = read_json(marker)
+    if any(item.get('skipped') for item in done.values()):
+        return
+    rows = []
+    cuts = {name: done[name]['threshold'] for name in ('bottleneck', 'residual')}
+    for split in ('val', 'test'):
+        tables = {}
+        for variant in VARIANTS:
+            tables[variant['name']] = pd.read_csv(root / variant['folder'] / f'predictions_{split}.csv')
+        if not tables['bottleneck']['person_id'].astype(str).equals(tables['residual']['person_id'].astype(str)):
+            raise ValueError(f'{task}/{split}: bottleneck and residual predictions are not aligned')
+        y = tables['bottleneck']['y'].to_numpy()
+        boot = PairedF1(y, cfg['bootstrap_samples'], cfg['seed'], device)
+        probabilities = {name: {'full': frame['full_probability'].to_numpy(),
+                                'masked': frame['masked_probability'].to_numpy()}
+                         for name, frame in tables.items()}
+        for inputs in ('full', 'masked'):
+            for metric in METRICS:
+                effect = boot.effects(
+                    probabilities['residual'][inputs], probabilities['bottleneck'][inputs],
+                    cuts['residual'], cuts['bottleneck'], METRICS[metric])[0]
+                rows.append(dict(
+                    task=task, split=split, contrast='within_input', model='signature_residual',
+                    inputs=inputs, reference='signature_bottleneck', metric=metric, n=len(y), **effect))
+        for metric in METRICS:
+            gain = boot.intervals(
+                _loss_draws(boot, probabilities['bottleneck']['full'], probabilities['bottleneck']['masked'],
+                            cuts['bottleneck'], cuts['bottleneck'], metric)
+                - _loss_draws(boot, probabilities['residual']['full'], probabilities['residual']['masked'],
+                              cuts['residual'], cuts['residual'], metric))[0]
+            rows.append(dict(
+                task=task, split=split, contrast='robustness', model='signature_residual', inputs='',
+                reference='signature_bottleneck', metric=metric, n=len(y), p_value=np.nan, **gain))
+        del boot
+    pd.DataFrame(rows).to_csv(root / 'signature_comparison.csv', index=False)
+    print(f'[signature {task}] residual bypass compared with the bottleneck', flush=True)
+
+
+def run_signature(task, cfg, device):
+    task_root = Path(cfg['output_root']) / task
+    relocate_residual_checkpoint(task_root)
+    if all(_finished(task_root / variant['folder']) for variant in VARIANTS):
+        skipped = any(read_json(task_root / variant['folder'] / 'DONE.json').get('skipped') for variant in VARIANTS)
+        if skipped or (task_root / 'signature_comparison.csv').exists():
+            print(f'[reuse] {task}/signature both variants', flush=True)
+            return
+    restoration_path = task_root / 'concept_diagnostics' / 'restoration.csv'
+    if not restoration_path.exists():
+        raise FileNotFoundError(
+            f'{task} concept diagnostics are required before the selected-concept CBM: {restoration_path}')
+    if not (task_root / 'mixed_cbm' / 'model.pt').exists():
+        raise FileNotFoundError(f'{task} Mixed CBM checkpoint is required for comparison')
+    selection = validation_concepts(pd.read_csv(restoration_path, dtype={'concept_id': str}))
+    selection['task'] = task
+    for variant in VARIANTS:
+        run_variant(task, cfg, device, variant, selection)
+    compare_variants(task, cfg, device)
 
 
 def _label(task):
@@ -271,21 +400,97 @@ def _publish(performance, comparisons):
     return pd.concat([published, extra], ignore_index=True)
 
 
+def _selection_record(root, task):
+    for variant in VARIANTS:
+        path = root / task / variant['folder'] / 'selected_concepts.json'
+        if path.exists():
+            return read_json(path)
+    return None
+
+
+def _variant_frames(root, tasks, folder):
+    available = [task for task in tasks
+                 if (root / task / folder / 'performance.csv').exists()
+                 and (root / task / folder / 'comparisons.csv').exists()]
+    if not available:
+        return available, pd.DataFrame(), pd.DataFrame()
+    performance = pd.concat([pd.read_csv(root / task / folder / 'performance.csv') for task in available], ignore_index=True)
+    comparisons = pd.concat([pd.read_csv(root / task / folder / 'comparisons.csv') for task in available], ignore_index=True)
+    return available, performance, comparisons
+
+
+def _variant_lines(split, available, performance, comparisons, signature_key, signature_label):
+    names = {signature_key: signature_label, **BASELINE_NAMES}
+    models = (signature_key, 'mixed_cbm', 'full_clinical')
+    split_performance = performance[performance.split == split] if len(performance) else performance
+    split_comparisons = comparisons[comparisons.split == split] if len(comparisons) else comparisons
+    lines = [f'## {signature_label}', '']
+    if split_performance.empty:
+        return lines + ['This run has not been evaluated.', ''], split_performance, split_comparisons
+    lines += ['Cells show the point estimate and 95% CI. Each model uses its own saved threshold.', '']
+    body = []
+    for task in available:
+        for model in models:
+            cells = []
+            for inputs in ('full', 'masked'):
+                row = split_performance[(split_performance.task == task) & (split_performance.model == model)
+                                        & (split_performance.inputs == inputs)]
+                if row.empty:
+                    cells.append('NA')
+                else:
+                    item = row.iloc[0].to_dict()
+                    cells.append('<br>'.join(f'{metric.upper()}: {_show(item, metric)}'
+                                             for metric in ('auroc', 'f1', 'ba', 'brier')))
+            body.append([_label(task), names[model], *cells])
+    lines += [md(['Task', 'Model', 'Full inputs', 'Masked inputs'], body),
+              '### Loss after removing nonbasic clinical inputs', '',
+              'AUROC, F1, and BA losses are full-input performance minus masked-input performance. '
+              'The Brier loss is the increase, masked minus full. Positive values mean the removal worsened that metric.', '']
+    losses = split_comparisons[split_comparisons.contrast == 'input_loss']
+    loss_rows = []
+    for task in available:
+        for model in models:
+            loss_rows.append([_label(task), names[model],
+                              *_cells(losses[(losses.task == task) & (losses.model == model)],
+                                      ('auroc', 'f1', 'ba', 'brier'))])
+    lines += [md(['Task', 'Model', 'AUROC loss', 'F1 loss', 'BA loss', 'Brier increase'], loss_rows),
+              f'### {signature_label} minus all-concept Mixed CBM', '',
+              'Positive AUROC, F1, and BA mean this selected-concept run is higher. '
+              'A positive Brier difference means its probability error is higher.', '']
+    within = split_comparisons[split_comparisons.contrast == 'within_input']
+    within_rows = []
+    for task in available:
+        for inputs, title in (('full', 'Full inputs'), ('masked', 'Masked inputs')):
+            within_rows.append([_label(task), title,
+                                *_cells(within[(within.task == task) & (within.inputs == inputs)],
+                                        ('auroc', 'f1', 'ba', 'brier'))])
+    lines += [md(['Task', 'Inputs', 'ΔAUROC', 'ΔF1', 'ΔBA', 'ΔBrier'], within_rows),
+              '### Robustness gain', '',
+              'Robustness gain is the comparison model’s masking loss minus this run’s masking loss. '
+              'A positive value means this run loses less when nonbasic clinical inputs are removed.', '']
+    gains = split_comparisons[split_comparisons.contrast == 'robustness']
+    gain_rows = []
+    for task in available:
+        for reference in ('mixed_cbm', 'full_clinical'):
+            gain_rows.append([_label(task), BASELINE_NAMES[reference],
+                              *_cells(gains[(gains.task == task) & (gains.reference == reference)],
+                                      ('auroc', 'f1', 'ba', 'brier'))])
+    lines += [md(['Task', 'Comparison', 'AUROC', 'F1', 'BA', 'Brier'], gain_rows)]
+    return lines, split_performance, split_comparisons
+
+
 def make_signature_report(cfg):
-    """Aggregate completed selected-concept CBMs. The concept list stays the validation list."""
+    """Aggregate both selected-concept runs. The concept list stays the validation list."""
     root = Path(cfg['output_root'])
     out = root / 'tables'
     out.mkdir(exist_ok=True)
-    tasks = []
-    for task in cfg['tasks']:
-        marker = root / task / 'signature_cbm' / 'DONE.json'
-        if marker.exists() and read_json(marker).get('version') == VERSION:
-            tasks.append(task)
+    tasks = [task for task in cfg['tasks']
+             if any(_finished(root / task / variant['folder']) for variant in VARIANTS)]
     if not tasks:
         return
     selections = []
     for task in tasks:
-        record = read_json(root / task / 'signature_cbm' / 'selected_concepts.json')
+        record = _selection_record(root, task)
         if record['concepts']:
             for concept in record['concepts']:
                 selections.append(dict(
@@ -298,38 +503,24 @@ def make_signature_report(cfg):
                 source_fields='', validation_auroc_gain=np.nan, validation_rank=np.nan))
     concepts = pd.DataFrame(selections)
     concepts.to_csv(out / 'SIGNATURE_CONCEPTS.csv', index=False)
-    available = [task for task in tasks
-                 if (root / task / 'signature_cbm' / 'performance.csv').exists()
-                 and (root / task / 'signature_cbm' / 'comparisons.csv').exists()]
-    performance = (pd.concat([pd.read_csv(root / task / 'signature_cbm' / 'performance.csv') for task in available],
-                             ignore_index=True) if available else pd.DataFrame())
-    comparisons = (pd.concat([pd.read_csv(root / task / 'signature_cbm' / 'comparisons.csv') for task in available],
-                             ignore_index=True) if available else pd.DataFrame())
-    names = {'signature_cbm': 'Selected-concept CBM', 'mixed_cbm': 'All-concept Mixed CBM',
-             'full_clinical': 'Full Clinical model'}
+    exports = {'bottleneck': 'SIGNATURE_CBM', 'residual': 'SIGNATURE_CBM_RESIDUAL'}
     for split in ('val', 'test'):
-        split_performance = performance[performance.split == split] if len(performance) else performance
-        split_comparisons = comparisons[comparisons.split == split] if len(comparisons) else comparisons
-        if len(split_performance) and len(split_comparisons):
-            _publish(split_performance, split_comparisons).to_csv(out / f'SIGNATURE_CBM_{split}.csv', index=False)
         lines = [f'# Selected-concept CBM — {split}', '',
                  f'Completed tasks: {len(tasks)}/{len(cfg["tasks"])}. Seed {cfg["seed"]}. '
                  f'{cfg["bootstrap_samples"]:,} paired, outcome-stratified bootstrap resamples.', '',
-                 'Concept IDs are frozen from validation predicted-restoration ΔAUROC before training. '
-                 'μ and σ are the mean and population SD (ddof=0) of the individual validation gains, '
+                 'Two selected-concept models are trained from the same frozen validation concept list. '
+                 'The bottleneck run routes the outcome through those concepts only. '
+                 'The residual-bypass run also gives the outcome MLP the part of the frozen embedding orthogonal to the concept-layer weights. '
+                 'μ and σ are the mean and population SD (ddof=0) of the individual validation predicted-restoration gains, '
                  'and an ID is kept only when its validation gain is strictly above μ + 2σ. '
-                 'The same IDs define the concept layer for training, validation, and test. '
-                 'Test gains are not used to compute μ, σ, the cutoff, or the selected IDs.', '',
-                 'The selected-concept model is a new Mixed CBM on the frozen Full Clinical backbone. '
-                 'Its concept layer and outcome MLP contain only the retained concepts. '
-                 'There is no bypass from the fused embedding to the outcome. '
+                 'Test gains are not used to choose the concept list.', '',
                  'Masking removes nonbasic clinical inputs; Basic Clinical features and the other eight modalities remain. '
-                 'The checkpoint and decision threshold are selected on masked validation inputs.', '',
+                 'Each run selects its checkpoint and decision threshold on masked validation inputs.', '',
                  '## Validation concept list', '',
-                 'This list is identical for the validation and test reports.', '']
+                 'Both runs use this list.', '']
         cutoff_rows = []
         for task in tasks:
-            record = read_json(root / task / 'signature_cbm' / 'selected_concepts.json')
+            record = _selection_record(root, task)
             cutoff_rows.append([_label(task), record['n_evaluated'], f'{record["mean"]:+.6f}',
                                 f'{record["std"]:.6f}', f'{record["cutoff"]:+.6f}', len(record['concept_ids'])])
         lines += [md(['Task', 'Evaluated IDs', 'μ', 'σ', 'μ + 2σ', 'Selected IDs'], cutoff_rows)]
@@ -337,68 +528,45 @@ def make_signature_report(cfg):
             chosen = concepts[(concepts.task == task) & (concepts.n_selected > 0)]
             lines += [f'### {_label(task)}', '']
             if chosen.empty:
-                lines += ['No Concept ID exceeded the validation μ + 2σ cutoff, so no selected-concept CBM was trained.', '']
+                lines += ['No Concept ID exceeded the validation μ + 2σ cutoff, so neither run was trained.', '']
                 continue
             lines += [md(['Validation rank', 'Concept ID', 'Concept', 'Source fields', 'Validation ΔAUROC'],
                          [[int(row.validation_rank), row.concept_id, row.concept_name, row.source_fields,
                            f'{row.validation_auroc_gain:+.6f}'] for row in chosen.itertuples()])]
-        if split_performance.empty:
-            lines += ['No trained selected-concept CBM has been evaluated.', '']
+        for variant in VARIANTS:
+            available, performance, comparisons = _variant_frames(root, tasks, variant['folder'])
+            section, split_performance, split_comparisons = _variant_lines(
+                split, available, performance, comparisons, variant['key'], variant['label'])
+            lines += section
+            if len(split_performance) and len(split_comparisons):
+                _publish(split_performance, split_comparisons).to_csv(
+                    out / f'{exports[variant["name"]]}_{split}.csv', index=False)
+        compared = [task for task in tasks if (root / task / 'signature_comparison.csv').exists()]
+        lines += ['## Residual bypass minus bottleneck', '',
+                  'Positive AUROC, F1, and BA mean the residual-bypass run is higher. '
+                  'A positive Brier difference means its probability error is higher. '
+                  'A positive robustness gain means the residual-bypass run loses less when nonbasic clinical inputs are removed.', '']
+        if not compared:
+            lines += ['The paired comparison has not been computed.', '']
         else:
-            lines += ['## Performance', '',
-                      'Cells show the point estimate and 95% CI. Each model uses its own saved threshold.', '']
-            header = ['Task', 'Model', 'Full inputs', 'Masked inputs']
-            body = []
-            for task in available:
-                for model in ('signature_cbm', 'mixed_cbm', 'full_clinical'):
-                    cells = []
-                    for inputs in ('full', 'masked'):
-                        row = split_performance[(split_performance.task == task) & (split_performance.model == model)
-                                                & (split_performance.inputs == inputs)]
-                        if row.empty:
-                            cells.append('NA')
-                        else:
-                            item = row.iloc[0].to_dict()
-                            cells.append('<br>'.join(f'{metric.upper()}: {_show(item, metric)}'
-                                                     for metric in ('auroc', 'f1', 'ba', 'brier')))
-                    body.append([_label(task), names[model], *cells])
-            lines += [md(header, body),
-                      '## Loss after removing nonbasic clinical inputs', '',
-                      'AUROC, F1, and BA losses are full-input performance minus masked-input performance. '
-                      'The Brier loss is the increase, masked minus full. Positive values mean the removal worsened that metric.', '']
-            loss_rows = []
-            losses = split_comparisons[split_comparisons.contrast == 'input_loss']
-            for task in available:
-                for model in ('signature_cbm', 'mixed_cbm', 'full_clinical'):
-                    loss_rows.append([_label(task), names[model],
-                                      *_cells(losses[(losses.task == task) & (losses.model == model)],
-                                              ('auroc', 'f1', 'ba', 'brier'))])
-            lines += [md(['Task', 'Model', 'AUROC loss', 'F1 loss', 'BA loss', 'Brier increase'], loss_rows),
-                      '## Selected-concept CBM minus all-concept Mixed CBM', '',
-                      'Positive AUROC, F1, and BA mean the selected-concept CBM is higher. '
-                      'A positive Brier difference means its probability error is higher.', '']
-            within_rows = []
-            within = split_comparisons[split_comparisons.contrast == 'within_input']
-            for task in available:
+            paired = pd.concat([pd.read_csv(root / task / 'signature_comparison.csv') for task in compared], ignore_index=True)
+            paired = paired[paired.split == split]
+            paired.to_csv(out / f'SIGNATURE_BYPASS_COMPARISON_{split}.csv', index=False)
+            within_rows, gain_rows = [], []
+            for task in compared:
                 for inputs, title in (('full', 'Full inputs'), ('masked', 'Masked inputs')):
                     within_rows.append([_label(task), title,
-                                        *_cells(within[(within.task == task) & (within.inputs == inputs)],
+                                        *_cells(paired[(paired.task == task) & (paired.contrast == 'within_input')
+                                                       & (paired.inputs == inputs)],
                                                 ('auroc', 'f1', 'ba', 'brier'))])
+                gain_rows.append([_label(task), *_cells(paired[(paired.task == task) & (paired.contrast == 'robustness')],
+                                                        ('auroc', 'f1', 'ba', 'brier'))])
             lines += [md(['Task', 'Inputs', 'ΔAUROC', 'ΔF1', 'ΔBA', 'ΔBrier'], within_rows),
-                      '## Robustness gain', '',
-                      'Robustness gain is the comparison model’s masking loss minus the selected-concept CBM’s masking loss. '
-                      'A positive value means the selected-concept CBM loses less when nonbasic clinical inputs are removed. '
-                      'Intervals condition on the fitted models and the validation-chosen concept list.', '']
-            gain_rows = []
-            gains = split_comparisons[split_comparisons.contrast == 'robustness']
-            for task in available:
-                for reference in ('mixed_cbm', 'full_clinical'):
-                    gain_rows.append([_label(task), names[reference],
-                                      *_cells(gains[(gains.task == task) & (gains.reference == reference)],
-                                              ('auroc', 'f1', 'ba', 'brier'))])
-            lines += [md(['Task', 'Comparison', 'AUROC', 'F1', 'BA', 'Brier'], gain_rows)]
+                      md(['Task', 'AUROC robustness', 'F1 robustness', 'BA robustness', 'Brier robustness'], gain_rows)]
         lines += ['## Exports', '',
-                  f'[SIGNATURE_CBM_{split}.csv](SIGNATURE_CBM_{split}.csv) contains one performance value per input '
-                  'and the paired masking losses. [SIGNATURE_CONCEPTS.csv](SIGNATURE_CONCEPTS.csv) is the frozen validation list.', '']
+                  f'[SIGNATURE_CBM_{split}.csv](SIGNATURE_CBM_{split}.csv) is the bottleneck run. '
+                  f'[SIGNATURE_CBM_RESIDUAL_{split}.csv](SIGNATURE_CBM_RESIDUAL_{split}.csv) is the residual-bypass run. '
+                  f'[SIGNATURE_BYPASS_COMPARISON_{split}.csv](SIGNATURE_BYPASS_COMPARISON_{split}.csv) compares them. '
+                  '[SIGNATURE_CONCEPTS.csv](SIGNATURE_CONCEPTS.csv) is the frozen validation list shared by both runs.', '']
         (out / f'SUMMARY_SIGNATURE_{split}.md').write_text('\n'.join(lines))
     print(f'[signature tables] {len(tasks)}/{len(cfg["tasks"])} tasks: {out}', flush=True)

@@ -156,12 +156,13 @@ class IndividualCBM(nn.Module):
 def state(model): return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
 
-def fit(train, val, labels, schema, cfg, device, masked_train=None):
+def fit(train, val, labels, schema, cfg, device, masked_train=None, model_cls=None):
     """Frozen backbone; concept warm-up, head fitting, then joint readout tuning.
 
     Mixed mode oversamples participants once per epoch, then presents both
     views of each sampled participant with equal weight. Encoding statistics
     and vocabulary are fitted to unique original training participants only.
+    A model with a bypass module trains that module with the outcome head.
     """
     torch.manual_seed(cfg['seed'])
     spec, data = prepare(train, val, labels, schema)
@@ -170,10 +171,12 @@ def fit(train, val, labels, schema, cfg, device, masked_train=None):
     if masked_train is not None:
         masked = torch.as_tensor((np.asarray(masked_train)-np.asarray(spec['x_mean']))/np.asarray(spec['x_std']),
                                  dtype=torch.float32, device=device)
-    model = IndividualCBM(spec).to(device); history = []; selections = {}; reference = None
+    model = (model_cls or IndividualCBM)(spec).to(device); history = []; selections = {}; reference = None
     phases = (('concept', cfg['concept_epochs']), ('head', cfg['head_epochs']), ('joint', cfg['joint_epochs']))
     for phase_index, (phase, epochs) in enumerate(phases):
         model.concept_layer.requires_grad_(phase != 'head'); model.task_head.requires_grad_(phase != 'concept')
+        bypass = getattr(model, 'bypass', None)
+        if bypass is not None: bypass.requires_grad_(phase != 'concept')
         optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
                                      lr=cfg['cbm_learning_rate'], weight_decay=cfg['cbm_weight_decay'])
         best, best_key, best_epoch, stale = state(model), (-float('inf'), -float('inf')), 0, 0
@@ -209,10 +212,12 @@ def fit(train, val, labels, schema, cfg, device, masked_train=None):
         if phase == 'head':
             with torch.no_grad(): reference = model.losses(data[1])[0].cpu().numpy()
     _, p = predict(model, val['embedding'])
-    return dict(spec=spec, states={'joint':state(model)}, selection=selections,
-                threshold=threshold(val['y'], p), backbone_frozen=True,
-                training_views=['full','masked'] if masked_train is not None else ['basic'],
-                concept_lambda=cfg['concept_lambda'], concept_tolerance=cfg['concept_tolerance']), history
+    artifact = dict(spec=spec, states={'joint':state(model)}, selection=selections,
+                    threshold=threshold(val['y'], p), backbone_frozen=True,
+                    training_views=['full','masked'] if masked_train is not None else ['basic'],
+                    concept_lambda=cfg['concept_lambda'], concept_tolerance=cfg['concept_tolerance'])
+    if getattr(model, 'bypass_kind', None): artifact['bypass'] = model.bypass_kind
+    return artifact, history
 
 
 def restore(artifact, device, arm='joint'):
